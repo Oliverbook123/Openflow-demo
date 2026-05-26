@@ -88,13 +88,19 @@ export default function NodeEditor() {
     // 开始执行（后台运行，不打开窗口）
     setExecuting(true);
     try {
-      await invoke("flow_execute_node", {
+      const result = await invoke<string>("flow_execute_node", {
         projectPath: projectPath || ".",
         nodeId: selectedNode.id,
       });
+      // 执行成功，更新本地状态为 Completed
+      setNodeStatus(selectedNode.id, NodeStatus.Completed);
+      updateNode(selectedNode.id, { output_paths: [result] });
+      console.log("执行成功:", result);
     } catch (e: any) {
       console.error("执行失败:", e);
-      // 后端已经持久化为 NeedsIntervention，本地等 event 更新
+      // 后端已经持久化为 NeedsIntervention，本地更新为 NeedsIntervention
+      setNodeStatus(selectedNode.id, NodeStatus.NeedsIntervention);
+      updateNode(selectedNode.id, { error_message: String(e) });
     } finally {
       setExecuting(false);
     }
@@ -108,14 +114,6 @@ export default function NodeEditor() {
     [NodeStatus.Completed]: "bg-green-500",
   };
 
-  const statusLabels: Record<NodeStatus, string> = {
-    [NodeStatus.PendingEdit]: "待编辑",
-    [NodeStatus.PendingExec]: "待执行",
-    [NodeStatus.Running]: "执行中",
-    [NodeStatus.NeedsIntervention]: "需介入",
-    [NodeStatus.Completed]: "完成",
-  };
-
   const d = selectedNode.data;
   const canLaunch =
     (d.status === NodeStatus.PendingEdit && prompt.trim().length > 0) ||
@@ -126,12 +124,36 @@ export default function NodeEditor() {
     <div className="p-4 space-y-4 flex flex-col h-full">
       <h3 className="text-sm font-semibold text-gray-700">节点编辑器</h3>
 
-      {/* 状态 */}
+      {/* 状态 + 手动切换 */}
       <div className="flex items-center gap-2">
         <span
           className={`w-2.5 h-2.5 rounded-full ${statusColors[d.status]}`}
         />
-        <span className="text-xs text-gray-500">{statusLabels[d.status]}</span>
+        <select
+          value={d.status}
+          onChange={(e) => {
+            const newStatus = e.target.value as NodeStatus;
+            setNodeStatus(selectedNode.id, newStatus);
+            if (newStatus === NodeStatus.PendingEdit) {
+              updateNode(selectedNode.id, { error_message: undefined });
+            }
+            // 同步持久化
+            if (projectPath) {
+              invoke("flow_update_node_status", {
+                projectPath,
+                nodeId: selectedNode.id,
+                status: newStatus,
+              }).catch(console.error);
+            }
+          }}
+          className="text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer"
+        >
+          <option value={NodeStatus.PendingEdit}>待编辑</option>
+          <option value={NodeStatus.PendingExec}>待执行</option>
+          <option value={NodeStatus.Running}>执行中</option>
+          <option value={NodeStatus.Completed}>完成</option>
+          <option value={NodeStatus.NeedsIntervention}>需介入</option>
+        </select>
         {/* 打开终端窗口按钮 */}
         {(d.status === NodeStatus.Running ||
           d.status === NodeStatus.Completed ||

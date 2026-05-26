@@ -1,8 +1,9 @@
 pub mod file_tree;
 pub mod storage;
+pub mod terminal;
 
 use crate::models::{FlowProject, NodeStatus};
-use std::process::{Command, Stdio};
+use std::io::Read;
 use tauri::{AppHandle, Emitter};
 
 /// 执行单个节点：后台启动 pi，实时推送日志
@@ -11,6 +12,7 @@ pub async fn flow_execute_node(
     app: AppHandle,
     project_path: String,
     node_id: String,
+    terminal_store: tauri::State<'_, std::sync::Arc<crate::commands::terminal::TerminalStore>>,
 ) -> Result<String, String> {
     // 从存储加载项目
     let storage = storage::FlowStorage::new(&project_path);
@@ -41,34 +43,70 @@ pub async fn flow_execute_node(
         "status": "running"
     }));
 
-    // 构建 pi 命令：pi -p --no-session "任务描述"
-    // 如果有依赖文档，通过 --append-system-prompt 作为上下文传递
-    let cmd_str = format!("pi -p --no-session \"{}\"", node.data.label.replace('"', "\\\""));
-    let mut cmd = Command::new("pi");
-    cmd.arg("-p");
-    cmd.arg("--no-session");
-    cmd.arg(&node.data.label);
-    cmd.current_dir(&project_path);
+    // 在 PTY 中启动 pi 命令
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("打开 PTY 失败: {}", e))?;
 
-    // 添加依赖文档作为上下文（通过 --append-system-prompt 传递文件内容）
-    for dep_path in &node.data.dependency_paths {
-        if std::path::Path::new(&dep_path).exists() {
-            if let Ok(content) = std::fs::read_to_string(&dep_path) {
-                // 只传递文件前 4000 字符作为上下文
-                let preview = if content.len() > 4000 {
-                    format!("{}...\n[文件过长，仅显示前 4000 字符]", &content[..4000])
-                } else {
-                    content
-                };
-                // 使用 stdin 传递更复杂的上下文，这里简化为通过 label 拼接
-            }
-        }
+    let mut pty_cmd = portable_pty::CommandBuilder::new("pi");
+    pty_cmd.arg("-p");
+    pty_cmd.arg("--no-session");
+    pty_cmd.arg(&node.data.label);
+    pty_cmd.cwd(&project_path);
+    pty_cmd.env("TERM", "xterm-256color");
+
+    let child = pair
+        .slave
+        .spawn_command(pty_cmd)
+        .map_err(|e| format!("在 PTY 中启动 pi 失败: {}", e))?;
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("获取 PTY writer 失败: {}", e))?;
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("获取 PTY reader 失败: {}", e))?;
+
+    // 分配 terminal_id 并存入 store
+    let terminal_id = {
+        let mut next = terminal_store.next_id.lock().map_err(|e| e.to_string())?;
+        let id = *next;
+        *next += 1;
+        id
+    };
+
+    {
+        let mut terminals = terminal_store.terminals.lock().map_err(|e| e.to_string())?;
+        terminals.insert(
+            terminal_id,
+            crate::commands::terminal::PtyHandle {
+                writer,
+                _master: pair.master,
+                child,
+            },
+        );
     }
 
-    // 通知前端：开始执行
+    // 持久化 terminal_id 到节点
+    // （使用 json 格式存储到 output_paths 中，作为 hack）
+    if let Some(n) = updated_project.nodes.iter_mut().find(|n| n.id == node_id) {
+        n.data.meta.insert("terminal_id".to_string(), terminal_id.to_string());
+        let _ = storage.save_project(&updated_project);
+    }
+
+    // 通知前端：开始执行，传递 terminal_id
     let _ = app.emit("execution_log", serde_json::json!({
         "node_id": &node_id,
-        "message": format!("$ {}\n", cmd_str),
+        "message": format!("$ pi -p --no-session \"{}\"\n", node.data.label),
         "timestamp": chrono::Utc::now().timestamp_millis()
     }));
     let _ = app.emit("execution_log", serde_json::json!({
@@ -76,100 +114,106 @@ pub async fn flow_execute_node(
         "message": format!("📂 项目目录: {}", project_path),
         "timestamp": chrono::Utc::now().timestamp_millis()
     }));
+    let _ = app.emit("execution_log", serde_json::json!({
+        "node_id": &node_id,
+        "message": format!("🔗 PTY #{}", terminal_id),
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    }));
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let _ = app.emit("node_status_changed", serde_json::json!({
+        "node_id": &node_id,
+        "status": "running",
+        "terminal_id": terminal_id
+    }));
 
-    // spawn 后直接 wait_with_output（同步等待完整输出后再一次性 emit）
-    let cmd_output = cmd.output().map_err(|e| {
-        format!("启动 pi 失败: {}", e)
-    })?;
+    // 后台线程：读取 PTY 输出并推送
+    let app_clone = app.clone();
+    let id_clone = node_id.clone();
+    let store_clone = terminal_store.inner().clone();
 
-    let status = cmd_output.status;
-    let stdout_str = String::from_utf8_lossy(&cmd_output.stdout);
-    let stderr_str = String::from_utf8_lossy(&cmd_output.stderr);
-    let mut output = stdout_str.to_string();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut output = String::new();
 
-    // 一次性将 stdout 推送到前端
-    for line in stdout_str.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            let _ = app.emit("execution_log", serde_json::json!({
-                "node_id": &node_id,
-                "message": trimmed.to_string(),
-                "timestamp": chrono::Utc::now().timestamp_millis()
-            }));
-        }
-    }
+        loop {
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    output.push_str(&text);
 
-    // 一次性将 stderr 推送到前端
-    for line in stderr_str.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            let _ = app.emit("execution_log", serde_json::json!({
-                "node_id": &node_id,
-                "message": format!("⚠️ {}", trimmed),
-                "timestamp": chrono::Utc::now().timestamp_millis()
-            }));
-        }
-    }
-
-    if status.success() {
-        let version = 1u32;
-        let doc_path = storage.save_task_document(&node_id, version, &output)?;
-
-        let mut project = storage.load_project()?.ok_or("项目未找到")?;
-        if let Some(n) = project.nodes.iter_mut().find(|n| n.id == node_id) {
-            n.data.status = NodeStatus::Completed;
-            n.data.output_paths.push(doc_path.clone());
-            let _ = storage.save_project(&project);
+                    let _ = app_clone.emit("terminal-data", serde_json::json!({
+                        "terminal_id": terminal_id,
+                        "data": text,
+                    }));
+                }
+                Ok(_) => break,
+                Err(_) => break,
+            }
         }
 
-        let _ = app.emit("execution_log", serde_json::json!({
-            "node_id": &node_id,
-            "message": format!("✅ 任务完成！产物: {}", doc_path),
-            "timestamp": chrono::Utc::now().timestamp_millis()
+        // 获取退出码
+        let exit_code = {
+            let mut terminals = match store_clone.terminals.lock() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            if let Some(handle) = terminals.get_mut(&terminal_id) {
+                match handle.child.try_wait() {
+                    Ok(Some(status)) => {
+                        if status.success() { 0 } else { 1 }
+                    }
+                    _ => -1,
+                }
+            } else {
+                -1
+            }
+        };
+
+        let _ = app_clone.emit("terminal-exit", serde_json::json!({
+            "terminal_id": terminal_id,
+            "exit_code": exit_code
         }));
 
-        let _ = app.emit("node_status_changed", serde_json::json!({
-            "node_id": &node_id,
-            "status": "completed",
-            "output_path": &doc_path
-        }));
+        // 根据退出码更新状态
+        let storage = storage::FlowStorage::new(&project_path);
 
-        Ok(doc_path)
-    } else {
-        let exit_code = status.code();
-        let error_msg = format!(
-            "❌ pi 执行失败，退出码: {:?}。请检查上方终端输出中的错误详情。",
-            exit_code
-        );
+        if exit_code == 0 {
+            let version = 1u32;
+            if let Ok(doc_path) = storage.save_task_document(&id_clone, version, &output) {
+                if let Ok(Some(mut proj)) = storage.load_project() {
+                    if let Some(n) = proj.nodes.iter_mut().find(|n| n.id == id_clone) {
+                        n.data.status = NodeStatus::Completed;
+                        n.data.output_paths.push(doc_path.clone());
+                        let _ = storage.save_project(&proj);
+                    }
 
-        let _ = app.emit("execution_log", serde_json::json!({
-            "node_id": &node_id,
-            "message": error_msg.clone(),
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        }));
-        let _ = app.emit("execution_log", serde_json::json!({
-            "node_id": &node_id,
-            "message": "💡 提示: 请确保 pi 命令可用 (which pi)".to_string(),
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        }));
+                    let _ = app_clone.emit("node_status_changed", serde_json::json!({
+                        "node_id": &id_clone,
+                        "status": "completed",
+                        "output_path": &doc_path
+                    }));
+                }
+            }
+        } else {
+            let error_msg = format!("❌ pi 执行失败，退出码: {}", exit_code);
 
-        let mut project = storage.load_project()?.ok_or("项目未找到")?;
-        if let Some(n) = project.nodes.iter_mut().find(|n| n.id == node_id) {
-            n.data.status = NodeStatus::NeedsIntervention;
-            n.data.error_message = Some(error_msg.clone());
-            let _ = storage.save_project(&project);
+            if let Ok(Some(mut proj)) = storage.load_project() {
+                if let Some(n) = proj.nodes.iter_mut().find(|n| n.id == id_clone) {
+                    n.data.status = NodeStatus::NeedsIntervention;
+                    n.data.error_message = Some(error_msg.clone());
+                    let _ = storage.save_project(&proj);
+                }
+
+                let _ = app_clone.emit("node_status_changed", serde_json::json!({
+                    "node_id": &id_clone,
+                    "status": "needs_intervention",
+                    "error": &error_msg
+                }));
+            }
         }
+    });
 
-        let _ = app.emit("node_status_changed", serde_json::json!({
-            "node_id": &node_id,
-            "status": "needs_intervention",
-            "error": &error_msg
-        }));
-
-        Err(error_msg)
-    }
+    Ok(terminal_id.to_string())
 }
 
 /// 保存项目到指定路径

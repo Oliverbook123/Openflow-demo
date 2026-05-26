@@ -39,6 +39,9 @@ pub struct NodeData {
     pub dependency_paths: Vec<String>,
     pub output_paths: Vec<String>,
     pub error_message: Option<String>,
+    /// 元数据（用于存储 terminal_id 等运行时信息）
+    #[serde(default)]
+    pub meta: std::collections::HashMap<String, String>,
 }
 
 /// 边数据
